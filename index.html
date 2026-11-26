@@ -1,0 +1,366 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Suez : Le verrou à 12 % — 3D Map Explainer</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<style>
+  html, body { margin: 0; background: #07111a; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<canvas id="ov" width="1920" height="1080"></canvas>
+<script type="importmap">
+{ "imports": { "three": "/node_modules/three/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { clamp, lerp, ss, track } from '/core/lib.js';
+
+const step01 = (a, b, x) => ss((x - a) / (b - a));
+const W = 1920, H = 1080;
+window.DUR = 30.0;
+
+const glCanvas = document.getElementById('gl');
+const ovCanvas = document.getElementById('ov');
+const g = ovCanvas.getContext('2d');
+
+const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1); renderer.setSize(W, H, false);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#07111a');
+const camera = new THREE.PerspectiveCamera(38, W / H, 0.1, 4000);
+
+// Load assets
+const [meta, heightBuf, s2Tex, shadowTex, worldTex] = await Promise.all([
+  fetch('./assets/meta.json').then(r => r.json()),
+  fetch('./assets/height.bin').then(r => r.arrayBuffer()),
+  new THREE.TextureLoader().loadAsync('./assets/s2.jpg'),
+  new THREE.TextureLoader().loadAsync('./assets/shadow.png'),
+  new THREE.TextureLoader().loadAsync('./assets/world.jpg'),
+]);
+await document.fonts.ready;
+
+let voDurs = null;
+try { const r = await fetch('./voices/dur.json'); if (r.ok) voDurs = await r.json(); } catch {}
+
+s2Tex.colorSpace = THREE.SRGBColorSpace;
+worldTex.colorSpace = THREE.SRGBColorSpace;
+
+const [lon0, lat0, lon1, lat1] = meta.bbox;
+const MAP_W = 240, MAP_H = 290;
+const llToXZ = (lon, lat) => [
+  ((lon - lon0) / (lon1 - lon0) - 0.5) * MAP_W,
+  (0.5 - (lat - lat0) / (lat1 - lat0)) * MAP_H,
+];
+
+// ---------------------------------------------------------------- Regional Terrain Mesh (3x relief)
+const hArr = new Float32Array(heightBuf);
+const GW = meta.w, GH = meta.h;
+const geo = new THREE.PlaneGeometry(MAP_W, MAP_H, GW - 1, GH - 1);
+geo.rotateX(-Math.PI / 2);
+const pos = geo.attributes.position;
+const hData = new Float32Array(GW * GH);
+for (let j = 0; j < GH; j++) {
+  for (let i = 0; i < GW; i++) {
+    const idx = j * GW + i;
+    const hm = hArr[idx];
+    hData[idx] = hm;
+    // 3x vertical exaggeration scaled to map units (1 map unit ~ 1 km)
+    pos.setY(idx, hm > 0 ? (hm / 1000.0) * 14.0 : 0.0);
+  }
+}
+geo.computeVertexNormals();
+
+const hTex = new THREE.DataTexture(hData, GW, GH, THREE.RedFormat, THREE.FloatType);
+hTex.flipY = true; hTex.needsUpdate = true;
+
+const terrainMat = new THREE.ShaderMaterial({
+  uniforms: {
+    tS2: { value: s2Tex },
+    tShadow: { value: shadowTex },
+    tH: { value: hTex },
+    uLight: { value: new THREE.Vector3(-0.82, 0.36, 0.44).normalize() },
+    uAlpha: { value: 1.0 },
+  },
+  transparent: true,
+  vertexShader: `
+    varying vec2 vUv; varying vec3 vN;
+    void main() {
+      vUv = uv;
+      vN = normalize(normalMatrix * normal);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }`,
+  fragmentShader: `
+    uniform sampler2D tS2, tShadow, tH;
+    uniform vec3 uLight; uniform float uAlpha;
+    varying vec2 vUv; varying vec3 vN;
+    void main() {
+      vec3 sat = texture2D(tS2, vUv).rgb;
+      float sh = texture2D(tShadow, vUv).r;
+      float hm = texture2D(tH, vUv).r;
+      // Warm desert grade on land; depth-shaded teal/navy on sea
+      vec3 land = mix(vec3(dot(sat, vec3(0.33))), sat, 0.85) * vec3(1.06, 0.98, 0.88);
+      float diff = max(dot(normalize(vN), uLight), 0.0);
+      land *= (0.42 + 0.68 * diff) * sh;
+      float depth = clamp(-hm / 120.0, 0.0, 1.0);
+      vec3 sea = mix(vec3(0.12, 0.35, 0.36), vec3(0.055, 0.133, 0.188), depth);
+      sea = mix(sea, sat * 0.45, 0.18 * (1.0 - depth));
+      vec3 col = hm > 1.0 ? land : sea;
+      gl_FragColor = vec4(col, uAlpha);
+    }`,
+});
+const terrainGroup = new THREE.Group();
+const terrainMesh = new THREE.Mesh(geo, terrainMat);
+terrainGroup.add(terrainMesh);
+
+// ---------------------------------------------------------------- Suez Canal Amber Route (193 km)
+const SUEZ_LL = [
+  [32.31, 31.26], [32.32, 31.02], [32.33, 30.80], [32.30, 30.60],
+  [32.35, 30.40], [32.42, 30.28], [32.55, 30.08], [32.56, 29.92],
+];
+const suezPts = SUEZ_LL.map(([lo, la]) => { const [x, z] = llToXZ(lo, la); return new THREE.Vector3(x, 0.35, z); });
+const suezCurve = new THREE.CatmullRomCurve3(suezPts);
+const tubeGeo = new THREE.TubeGeometry(suezCurve, 120, 0.75, 6, false);
+const suezMat = new THREE.ShaderMaterial({
+  uniforms: { uReveal: { value: 0 }, uT: { value: 0 } },
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+  fragmentShader: `
+    uniform float uReveal, uT; varying vec2 vUv;
+    void main() {
+      if (vUv.x > uReveal) discard;
+      float head = smoothstep(uReveal - 0.08, uReveal, vUv.x);
+      float pulse = 0.65 + 0.35 * sin(vUv.x * 36.0 - uT * 5.0);
+      vec3 col = mix(vec3(1.0, 0.65, 0.24), vec3(1.0, 0.88, 0.55), head);
+      gl_FragColor = vec4(col * (0.9 + head * 0.7) * pulse, 0.92);
+    }`,
+});
+terrainGroup.add(new THREE.Mesh(tubeGeo, suezMat));
+
+// Schematic ships moving along Suez
+const ships = [];
+for (let i = 0; i < 6; i++) {
+  const sm = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.35, 2.4), new THREE.MeshBasicMaterial({ color: '#f4e6cf' }));
+  terrainGroup.add(sm);
+  ships.push(sm);
+}
+
+// 12% Data Pillar at Great Bitter Lake (30.35N, 32.38E)
+const [px, pz] = llToXZ(32.38, 30.35);
+const pillarMat = new THREE.MeshBasicMaterial({ color: '#ffa63d', transparent: true, opacity: 0.92 });
+const pillar = new THREE.Mesh(new THREE.BoxGeometry(3.2, 12, 3.2), pillarMat);
+pillar.position.set(px + 9, 0, pz);
+terrainGroup.add(pillar);
+
+scene.add(terrainGroup);
+
+// ---------------------------------------------------------------- Globe (opening & closing Cape detour)
+const globeGroup = new THREE.Group();
+const globeMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(100, 64, 48),
+  new THREE.MeshBasicMaterial({ map: worldTex })
+);
+globeGroup.add(globeMesh);
+
+const llToSphere = (lon, lat, r = 100.6) => {
+  const phi = (90 - lat) * Math.PI / 180;
+  const theta = (lon + 180) * Math.PI / 180;
+  return new THREE.Vector3(
+    -r * Math.sin(phi) * Math.cos(theta),
+    r * Math.cos(phi),
+    r * Math.sin(phi) * Math.sin(theta)
+  );
+};
+
+// Amber Suez route on globe (Europe -> Suez -> Asia)
+const gSuezPts = [
+  [-5, 36], [14, 35], [32.3, 30.5], [43, 12.5], [58, 18], [75, 10]
+].map(([lo, la]) => llToSphere(lo, la, 100.8));
+const gSuezTube = new THREE.Mesh(
+  new THREE.TubeGeometry(new THREE.CatmullRomCurve3(gSuezPts), 64, 0.55, 6, false),
+  new THREE.MeshBasicMaterial({ color: '#ffa63d' })
+);
+globeGroup.add(gSuezTube);
+
+// Teal Cape of Good Hope detour on globe
+const gCapePts = [
+  [-6, 36], [-18, 15], [-10, -5], [8, -25], [18.5, -34.5], [36, -28], [48, -10], [60, 12], [75, 10]
+].map(([lo, la]) => llToSphere(lo, la, 100.8));
+const gCapeMat = new THREE.MeshBasicMaterial({ color: '#2fa3b0', transparent: true, opacity: 0 });
+const gCapeTube = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(gCapePts), 96, 0.55, 6, false), gCapeMat);
+globeGroup.add(gCapeTube);
+
+scene.add(globeGroup);
+
+// ---------------------------------------------------------------- Camera Tracks
+const CAM_KEYS = [
+  // Orbit dive onto Egypt/Suez
+  [0.0,  [-120, 140, 160,  -40, 30, 10]],
+  [5.5,  [-20,  110,  75,    0,  0,  0]],
+  // Fly low north -> south along Suez Canal
+  [9.5,  [ -8,   48, -85,    2,  0, -25]],
+  [14.5, [ 12,   34, -10,    4,  0,  18]],
+  // Oblique hold on 205m bottleneck & 12% pillar
+  [18.5, [ 52,   38,  46,    4,  6,  10]],
+  // Pull back out to globe for Cape detour
+  [23.5, [-110, 110, 150,  -30, 15,  5]],
+  [30.0, [-135,  35, 195,  -20, -25, 0]],
+];
+const camTrack = track(CAM_KEYS);
+
+const VO = [
+  { id: 's1', t: 1.0,  text: 'Entre la Méditerranée et la mer Rouge, 193 km verrouillent le commerce mondial.' },
+  { id: 's2', t: 9.8,  text: 'Chaque jour, 12 % des marchandises passent par ce goulet de seulement 205 mètres.' },
+  { id: 's3', t: 20.5, text: 'Si Suez ferme, les navires doivent contourner toute l’Afrique : +10 jours de mer.' },
+];
+
+window.EV = [
+  { t: 1.0,  type: 'dive' },
+  { t: 7.2,  type: 'ignite' },
+  { t: 14.5, type: 'pillar' },
+  { t: 18.5, type: 'silence' },
+  { t: 20.5, type: 'cape' },
+];
+
+const toScreen = (v) => {
+  const p = v.clone().project(camera);
+  return [(p.x * 0.5 + 0.5) * W, (-p.y * 0.5 + 0.5) * H, p.z];
+};
+
+function drawOverlay(t) {
+  g.clearRect(0, 0, W, H);
+
+  // Region labels (fade out when globe takes over)
+  const mapVis = step01(4.2, 6.2, t) * (1 - step01(20.0, 22.0, t));
+  if (mapVis > 0.02) {
+    g.save();
+    g.globalAlpha = mapVis;
+    g.font = '600 26px "Barlow Condensed", sans-serif';
+    g.fillStyle = '#bcdbe6';
+    g.textAlign = 'center';
+    const [mx, my] = toScreen(new THREE.Vector3(-45, 1, -110));
+    g.fillText('MER MÉDITERRANÉE', mx, my);
+    const [rx, ry] = toScreen(new THREE.Vector3(45, 1, 105));
+    g.fillText('MER ROUGE', rx, ry);
+
+    // 193 km label
+    const [sx, sy] = toScreen(new THREE.Vector3(px - 22, 2, pz - 30));
+    g.fillStyle = '#ffa63d';
+    g.font = '700 44px "Barlow Condensed", sans-serif';
+    g.fillText('193 KM', sx, sy);
+
+    // 12% pillar callout
+    const pGrow = step01(14.0, 16.5, t);
+    if (pGrow > 0.1) {
+      const [pxs, pys] = toScreen(new THREE.Vector3(px + 9, 13 * pGrow + 2, pz));
+      g.fillStyle = '#ffa63d';
+      g.font = '700 72px "Barlow Condensed", sans-serif';
+      g.fillText('12 %', pxs, pys - 10);
+      g.font = '500 22px "Barlow Condensed", sans-serif';
+      g.fillStyle = '#f6eee0';
+      g.fillText('DU COMMERCE MONDIAL · 205 M DE LARGE', pxs, pys + 18);
+    }
+    g.restore();
+  }
+
+  // Cape detour label on globe
+  const capeVis = step01(22.5, 24.5, t);
+  if (capeVis > 0.02) {
+    g.save();
+    g.globalAlpha = capeVis;
+    g.font = '700 54px "Barlow Condensed", sans-serif';
+    g.fillStyle = '#2fa3b0';
+    g.textAlign = 'left';
+    g.fillText('+10 JOURS · CAP DE BONNE-ESPÉRANCE', 110, 160);
+    g.font = '500 28px "Barlow Condensed", sans-serif';
+    g.fillStyle = '#ffa63d';
+    g.fillText('ROUTE DE SUEZ : 193 KM', 110, 205);
+    g.restore();
+  }
+
+  // Subtitles (bottom-left legend shelf with amber vertical rule)
+  let active = null;
+  for (const v of VO) {
+    const d = voDurs?.[v.id] ?? (v.text.length / 15 + 1.0);
+    if (t >= v.t && t <= v.t + d + 0.35) { active = v.text; break; }
+  }
+  if (active) {
+    g.save();
+    g.fillStyle = 'rgba(7, 17, 26, 0.84)';
+    g.fillRect(68, 945, 1180, 74);
+    g.fillStyle = '#ffa63d';
+    g.fillRect(68, 945, 6, 74);
+    g.font = '600 30px "Barlow Condensed", sans-serif';
+    g.fillStyle = '#f6eee0';
+    g.textAlign = 'left';
+    g.textBaseline = 'middle';
+    g.fillText(active, 92, 984);
+    g.restore();
+  }
+
+  // Required data attribution
+  g.save();
+  g.font = '500 16px "Barlow Condensed", sans-serif';
+  g.fillStyle = 'rgba(217, 230, 238, 0.55)';
+  g.textAlign = 'right';
+  g.fillText('Relief ×3 · Routes schématiques · Sentinel-2 Cloudless (EOX, CC BY 4.0) / AWS Terrain', W - 40, H - 24);
+  g.restore();
+}
+
+window.render = (t) => {
+  t = clamp(t, 0, DUR);
+  const c = camTrack(t);
+  camera.position.set(c[0], c[1], c[2]);
+  camera.lookAt(c[3], c[4], c[5]);
+  camera.updateMatrixWorld();
+
+  // Cross-dissolve through atmosphere between globe and regional terrain
+  const regVis = step01(3.8, 6.2, t) * (1 - step01(20.0, 22.8, t));
+  terrainGroup.visible = regVis > 0.01;
+  terrainMat.uniforms.uAlpha.value = regVis;
+  globeGroup.visible = regVis < 0.99;
+
+  // Position globe facing Africa / Suez / Cape of Good Hope toward the camera
+  globeGroup.position.set(-15, -12, 0);
+  globeGroup.rotation.y = -2.25 + t * 0.008;
+  globeGroup.rotation.x = 0.28 - step01(20.0, 26.0, t) * 0.38;
+  gCapeMat.opacity = step01(21.5, 24.5, t);
+
+  // Suez route reveal & ships
+  suezMat.uniforms.uReveal.value = step01(6.5, 11.5, t);
+  suezMat.uniforms.uT.value = t;
+  const pGrow = step01(14.0, 16.5, t);
+  pillar.scale.y = Math.max(0.01, pGrow);
+  pillar.position.y = 6 * pGrow;
+
+  for (let i = 0; i < ships.length; i++) {
+    const u = ((t * 0.045 + i / ships.length) % 1);
+    const pt = suezCurve.getPointAt(u);
+    const tg = suezCurve.getTangentAt(u);
+    ships[i].position.copy(pt).add(new THREE.Vector3(0, 0.4, 0));
+    ships[i].lookAt(pt.clone().add(tg));
+    ships[i].visible = suezMat.uniforms.uReveal.value > u;
+  }
+
+  renderer.render(scene, camera);
+  drawOverlay(t);
+};
+
+window.TEXTS = (t) => {
+  const out = [];
+  if (t >= 7.0 && t <= 14.0) out.push({ id: 'km', text: '193 KM', x0: 400, y0: 300, x1: 600, y1: 380 });
+  if (t >= 15.0 && t <= 19.5) out.push({ id: 'pct', text: '12 %', x0: 800, y0: 200, x1: 1050, y1: 320 });
+  if (t >= 23.0 && t <= 29.5) out.push({ id: 'cape', text: '+10 JOURS · CAP DE BONNE-ESPÉRANCE', x0: 110, y0: 110, x1: 900, y1: 180 });
+  return out;
+};
+
+window.READY = true;
+</script>
+</body>
+</html>

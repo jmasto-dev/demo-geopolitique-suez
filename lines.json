@@ -1,0 +1,5 @@
+[
+  { "id": "s1", "t": 1.0,  "voice": "fr-FR-HenriNeural", "rate": "+8%", "text": "Entre la Méditerranée et la mer Rouge, une bande de désert de cent quatre-vingt-treize kilomètres verrouille le commerce mondial." },
+  { "id": "s2", "t": 9.8,  "voice": "fr-FR-HenriNeural", "rate": "+8%", "text": "Chaque jour, douze pour cent des marchandises de la planète passent par ce goulet large de seulement deux cent cinq mètres." },
+  { "id": "s3", "t": 20.5, "voice": "fr-FR-HenriNeural", "rate": "+8%", "text": "Si le canal de Suez ferme, les navires doivent contourner toute l’Afrique : dix jours de mer en plus." }
+]

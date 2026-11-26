@@ -1,0 +1,14 @@
+# Credits — Suez : Le verrou à 12 % (3D Map Explainer)
+
+## Map Data & Imagery
+- Elevation & bathymetry: AWS Terrain Tiles (Mapzen / Tilezen Terrarium) — public / open attribution
+- Satellite imagery: Sentinel-2 Cloudless 2016 by EOX IT Services GmbH (https://s2maps.eu) — CC BY 4.0
+
+## Fonts
+- Barlow Condensed, Google Fonts — SIL Open Font License 1.1 (OFL)
+
+## Voice & Audio
+- Microsoft edge-tts (`fr-FR-HenriNeural`)
+- VSCO 2 Community Edition (cellos, cellos_pizz, horn, timpani) — CC0 1.0 Universal
+- Versilian Community Sample Library (vibraphone_bowed) — CC0 1.0 Universal
+- Procedural foley (`core/audio/sfx.py`)
